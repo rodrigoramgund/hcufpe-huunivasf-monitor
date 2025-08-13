@@ -5,6 +5,7 @@ import time
 from flask import Flask
 from telegram import Bot  # type: ignore
 import threading
+import os
 
 # --- CONFIGURAÇÕES DO BOT ---
 TELEGRAM_TOKEN = '8030537090:AAE_IztkT1YRYCUyDpACbu96KcWNOpVyoYU'
@@ -18,15 +19,17 @@ INTERVALO = 300  # 5 minutos
 bot = Bot(token=TELEGRAM_TOKEN)
 
 def obter_hash_da_pagina(url):
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        conteudo = soup.get_text()
-        return hashlib.sha256(conteudo.encode('utf-8')).hexdigest()
-    except Exception as e:
-        print(f"[ERRO] Falha ao acessar {url}: {e}")
-        return None
+    for tentativa in range(3):
+        try:
+            response = requests.get(url, timeout=20)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, 'html.parser')
+            conteudo = soup.get_text()
+            return hashlib.sha256(conteudo.encode('utf-8')).hexdigest()
+        except Exception as e:
+            print(f"[ERRO] Tentativa {tentativa+1}/3 ao acessar {url}: {e}")
+            time.sleep(3)
+    return None
 
 def monitorar():
     ultimos_hashes = {url: obter_hash_da_pagina(url) for url in URLS}
@@ -61,8 +64,10 @@ app = Flask(__name__)
 def home():
     return '🟢 Bot está rodando e monitorando as páginas do HC-UFPE e HU-UNIVASF (EBSERH 2024).'
 
-# Iniciar o monitoramento em outra thread
+# Iniciar o monitoramento em outra thread (fora do __main__, para rodar no Gunicorn)
 threading.Thread(target=monitorar, daemon=True).start()
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080)
+    port = int(os.environ.get('PORT', 8080))  # usa a porta do Render
+    app.run(host='0.0.0.0', port=port)
+
