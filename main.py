@@ -10,6 +10,13 @@ from bs4 import BeautifulSoup
 from flask import Flask
 from telegram import Bot  # type: ignore
 
+from datetime import datetime
+last_status = {
+    "last_check": None,  # timestamp
+    "urls": {}           # {url: {"pdfs": int, "last_change": "YYYY-MM-DD HH:MM"}}
+}
+
+
 # --- CONFIGURAÇÕES ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8030537090:AAE_IztkT1YRYCUyDpACbu96KcWNOpVyoYU")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "796275012")
@@ -121,12 +128,24 @@ def monitorar():
             else:
                 print(f"[BOT] nenhuma mudança em {url}")
 
+            # depois de obter 'snap' para cada url:
+            last_status["urls"][url] = {
+                "pdfs": len(snap.get("pdfs", [])),
+                "last_change": datetime.now().strftime("%Y-%m-%d %H:%M")
+            }
+            last_status["last_check"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+
         time.sleep(INTERVALO)
 
 # ---------- Flask (healthcheck) ----------
 @app.route("/")
 def home():
-    return "🟢 Bot online (Render)."
+    if not last_status["last_check"]:
+        return "🟢 Bot online (Render). Iniciando..."
+    lines = [f"🟢 Bot online (Render). Última checagem: {last_status['last_check']}"]
+    for url, info in last_status["urls"].items():
+        lines.append(f"- {url} → PDFs: {info['pdfs']} | última mudança: {info.get('last_change','-')}")
+    return "<br>".join(lines)
 
 # inicia o monitor em background (compatível com gunicorn)
 threading.Thread(target=monitorar, daemon=True).start()
