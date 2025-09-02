@@ -4,20 +4,14 @@ import json
 import hashlib
 import threading
 from typing import Dict, List, Optional
+from datetime import datetime
 
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask
 from telegram import Bot  # type: ignore
 
-from datetime import datetime
-last_status = {
-    "last_check": None,  # timestamp
-    "urls": {}           # {url: {"pdfs": int, "last_change": "YYYY-MM-DD HH:MM"}}
-}
-
-
-# --- CONFIGURAÇÕES ---
+# -------- Config --------
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8030537090:AAE_IztkT1YRYCUyDpACbu96KcWNOpVyoYU")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "796275012")
 
@@ -26,19 +20,19 @@ URLS = [
     "https://www.gov.br/ebserh/pt-br/acesso-a-informacao/agentes-publicos/concursos-e-selecoes/concursos/2024/convocacoes/hu-univasf",
 ]
 INTERVALO = int(os.environ.get("INTERVALO", "300"))  # segundos
-PERSIST_FILE = "state.json"  # arquivo local com o último estado
+PERSIST_FILE = "state.json"
 
 bot = Bot(token=TELEGRAM_TOKEN)
 app = Flask(__name__)
 
-# ---------- Persistência simples em arquivo ----------
+# -------- Status p/ homepage --------
+last_status: Dict[str, Dict] = {
+    "last_check": None,   # "YYYY-MM-DD HH:MM"
+    "urls": {}            # url -> {"pdfs": int, "last_change": str}
+}
+
+# -------- Persistência --------
 def load_state() -> Dict[str, Dict[str, object]]:
-    """Lê o último estado do disco. Exemplo:
-    {
-      "<url>": {"fp": "PDF:<hash>", "pdfs": ["...pdf1", "...pdf2"]},
-      ...
-    }
-    """
     try:
         with open(PERSIST_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -52,7 +46,7 @@ def save_state(state: Dict[str, Dict[str, object]]) -> None:
     except Exception as e:
         print(f"[STATE] erro ao salvar: {e}")
 
-# ---------- Coleta / fingerprint ----------
+# -------- Coleta / fingerprint --------
 def extrair_pdfs(soup: BeautifulSoup) -> List[str]:
     links = []
     for a in soup.find_all("a", href=True):
@@ -64,7 +58,6 @@ def extrair_pdfs(soup: BeautifulSoup) -> List[str]:
     return sorted(set(links))
 
 def fingerprint_por_pdf(url: str) -> Optional[Dict[str, object]]:
-    """Retorna dict com 'fp' (hash) e 'pdfs' (lista)."""
     try:
         resp = requests.get(url, timeout=20)
         resp.raise_for_status()
@@ -73,7 +66,6 @@ def fingerprint_por_pdf(url: str) -> Optional[Dict[str, object]]:
         if pdfs:
             fp = "PDF:" + hashlib.sha256("\n".join(pdfs).encode("utf-8")).hexdigest()
             return {"fp": fp, "pdfs": pdfs}
-        # fallback: hash do texto se não houver PDFs
         texto = soup.get_text(" ", strip=True)
         fp = "TXT:" + hashlib.sha256(texto.encode("utf-8")).hexdigest()
         return {"fp": fp, "pdfs": []}
@@ -81,7 +73,7 @@ def fingerprint_por_pdf(url: str) -> Optional[Dict[str, object]]:
         print(f"[ERRO] fingerprint {url}: {e}")
         return None
 
-# ---------- Monitor ----------
+# -------- Bot --------
 def enviar_alerta(url: str, novos_pdfs: List[str]):
     msg = f"⚠️ A página foi atualizada!\n👉 {url}"
     if novos_pdfs:
@@ -89,10 +81,11 @@ def enviar_alerta(url: str, novos_pdfs: List[str]):
         msg += f"\n\nNovos PDFs detectados:\n{lista}"
     bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
 
+# -------- Monitor (thread) --------
 def monitorar():
     state = load_state()
 
-    # inicializa snapshots se estiver vazio
+    # snapshot inicial
     for url in URLS:
         if url not in state:
             snap = fingerprint_por_pdf(url)
@@ -114,21 +107,19 @@ def monitorar():
                 state[url] = snap
                 save_state(state)
                 print(f"[BOT] inicializado {url}")
-                continue
-
-            if snap["fp"] != old["fp"]:
-                # calcula PDFs novos (se houver listas)
-                antigos = set(old.get("pdfs", []))
-                atuais = set(snap.get("pdfs", []))
-                novos = sorted(list(atuais - antigos))
-                enviar_alerta(url, novos_pdfs=novos)
-                state[url] = snap
-                save_state(state)
-                print(f"[BOT] mudança detectada em {url} (alerta enviado).")
             else:
-                print(f"[BOT] nenhuma mudança em {url}")
+                if snap["fp"] != old["fp"]:
+                    antigos = set(old.get("pdfs", []))
+                    atuais = set(snap.get("pdfs", []))
+                    novos = sorted(list(atuais - antigos))
+                    enviar_alerta(url, novos_pdfs=novos)
+                    state[url] = snap
+                    save_state(state)
+                    print(f"[BOT] mudança detectada em {url} (alerta enviado).")
+                else:
+                    print(f"[BOT] nenhuma mudança em {url}")
 
-            # depois de obter 'snap' para cada url:
+            # <<< ATUALIZA STATUS AQUI (após verificar cada URL)
             last_status["urls"][url] = {
                 "pdfs": len(snap.get("pdfs", [])),
                 "last_change": datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -137,7 +128,7 @@ def monitorar():
 
         time.sleep(INTERVALO)
 
-# ---------- Flask (healthcheck) ----------
+# -------- Flask --------
 @app.route("/")
 def home():
     if not last_status["last_check"]:
@@ -147,10 +138,14 @@ def home():
         lines.append(f"- {url} → PDFs: {info['pdfs']} | última mudança: {info.get('last_change','-')}")
     return "<br>".join(lines)
 
-# inicia o monitor em background (compatível com gunicorn)
+@app.route("/ping")
+def ping():
+    return "pong"
+
+# Inicia a thread FORA do __main__ (necessário p/ Gunicorn)
 threading.Thread(target=monitorar, daemon=True).start()
 
-# para rodar localmente; no Render usamos gunicorn
+# Para rodar localmente (no Render usamos Gunicorn)
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
