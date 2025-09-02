@@ -5,10 +5,11 @@ import hashlib
 import threading
 from typing import Dict, List, Optional
 from datetime import datetime
+import traceback
 
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask
+from flask import Flask, jsonify
 from telegram import Bot  # type: ignore
 
 # -------- Config --------
@@ -22,14 +23,21 @@ URLS = [
 INTERVALO = int(os.environ.get("INTERVALO", "300"))  # segundos
 PERSIST_FILE = "state.json"
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/124.0 Safari/537.36"
+}
+
 bot = Bot(token=TELEGRAM_TOKEN)
 app = Flask(__name__)
 
-# -------- Status p/ homepage --------
+# -------- Status / Diagnóstico --------
 last_status: Dict[str, Dict] = {
     "last_check": None,   # "YYYY-MM-DD HH:MM"
     "urls": {}            # url -> {"pdfs": int, "last_change": str}
 }
+last_error: Optional[str] = None  # guarda última exceção formatada
 
 # -------- Persistência --------
 def load_state() -> Dict[str, Dict[str, object]]:
@@ -59,7 +67,7 @@ def extrair_pdfs(soup: BeautifulSoup) -> List[str]:
 
 def fingerprint_por_pdf(url: str) -> Optional[Dict[str, object]]:
     try:
-        resp = requests.get(url, timeout=20)
+        resp = requests.get(url, headers=HEADERS, timeout=25)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
         pdfs = extrair_pdfs(soup)
@@ -81,66 +89,102 @@ def enviar_alerta(url: str, novos_pdfs: List[str]):
         msg += f"\n\nNovos PDFs detectados:\n{lista}"
     bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
 
-# -------- Monitor (thread) --------
-def monitorar():
-    state = load_state()
-
-    # snapshot inicial
+# -------- Uma rodada de verificação --------
+def rodada(state: Dict[str, Dict[str, object]]) -> Dict[str, Dict[str, object]]:
+    global last_status, last_error
     for url in URLS:
-        if url not in state:
-            snap = fingerprint_por_pdf(url)
-            if snap:
-                state[url] = snap
-                print(f"[INIT] snapshot salvo p/ {url}")
-    save_state(state)
-    print("[BOT] monitoramento iniciado.")
+        snap = fingerprint_por_pdf(url)
+        if not snap:
+            print(f"[BOT] erro ao obter {url}, pulando…")
+            continue
 
-    while True:
-        for url in URLS:
-            snap = fingerprint_por_pdf(url)
-            if not snap:
-                print(f"[BOT] erro ao obter {url}, pulando…")
-                continue
-
-            old = state.get(url)
-            if not old:
+        old = state.get(url)
+        if not old:
+            state[url] = snap
+            save_state(state)
+            print(f"[BOT] inicializado {url}")
+        else:
+            if snap["fp"] != old["fp"]:
+                antigos = set(old.get("pdfs", []))
+                atuais = set(snap.get("pdfs", []))
+                novos = sorted(list(atuais - antigos))
+                enviar_alerta(url, novos_pdfs=novos)
                 state[url] = snap
                 save_state(state)
-                print(f"[BOT] inicializado {url}")
+                print(f"[BOT] mudança detectada em {url} (alerta enviado).")
             else:
-                if snap["fp"] != old["fp"]:
-                    antigos = set(old.get("pdfs", []))
-                    atuais = set(snap.get("pdfs", []))
-                    novos = sorted(list(atuais - antigos))
-                    enviar_alerta(url, novos_pdfs=novos)
+                print(f"[BOT] nenhuma mudança em {url}")
+
+        # status da URL
+        last_status["urls"][url] = {
+            "pdfs": len(snap.get("pdfs", [])),
+            "last_change": datetime.now().strftime("%Y-%m-%d %H:%M")
+        }
+
+    last_status["last_check"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    last_error = None
+    return state
+
+# -------- Monitor (thread) --------
+def monitorar():
+    global last_error
+    try:
+        state = load_state()
+
+        # snapshot inicial
+        if not state:
+            print("[INIT] criando snapshots iniciais…")
+            for url in URLS:
+                snap = fingerprint_por_pdf(url)
+                if snap:
                     state[url] = snap
-                    save_state(state)
-                    print(f"[BOT] mudança detectada em {url} (alerta enviado).")
-                else:
-                    print(f"[BOT] nenhuma mudança em {url}")
+                    print(f"[INIT] snapshot salvo p/ {url}")
+            save_state(state)
 
-            # <<< ATUALIZA STATUS AQUI (após verificar cada URL)
-            last_status["urls"][url] = {
-                "pdfs": len(snap.get("pdfs", [])),
-                "last_change": datetime.now().strftime("%Y-%m-%d %H:%M")
-            }
-            last_status["last_check"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        print("[BOT] monitoramento iniciado.")
+        while True:
+            try:
+                state = rodada(state)
+            except Exception as e:
+                # captura erro da rodada, mas mantém a thread viva
+                last_error = f"{e}\n{traceback.format_exc()}"
+                print(f"[LOOP] erro na rodada: {last_error}")
+            time.sleep(INTERVALO)
 
-        time.sleep(INTERVALO)
+    except Exception as e:
+        # erro fatal ao iniciar a thread
+        last_error = f"{e}\n{traceback.format_exc()}"
+        print(f"[FATAL] thread caiu ao iniciar: {last_error}")
 
 # -------- Flask --------
 @app.route("/")
 def home():
     if not last_status["last_check"]:
-        return "🟢 Bot online (Render). Iniciando..."
-    lines = [f"🟢 Bot online (Render). Última checagem: {last_status['last_check']}"]
-    for url, info in last_status["urls"].items():
-        lines.append(f"- {url} → PDFs: {info['pdfs']} | última mudança: {info.get('last_change','-')}")
-    return "<br>".join(lines)
+        base = "🟢 Bot online (Render). Iniciando..."
+    else:
+        lines = [f"🟢 Bot online (Render). Última checagem: {last_status['last_check']}"]
+        for url, info in last_status["urls"].items():
+            lines.append(f"- {url} → PDFs: {info['pdfs']} | última atualização local: {info.get('last_change','-')}")
+        base = "<br>".join(lines)
+    if last_error:
+        base += f"<br><br>⚠️ Último erro:<br><pre>{last_error}</pre>"
+    return base
 
 @app.route("/ping")
 def ping():
     return "pong"
+
+@app.route("/tick")
+def tick():
+    """Força uma rodada agora e retorna JSON com status/erro."""
+    try:
+        state = load_state()
+        state = rodada(state)
+        save_state(state)
+        return jsonify({"ok": True, "last_status": last_status})
+    except Exception as e:
+        err = f"{e}\n{traceback.format_exc()}"
+        return jsonify({"ok": False, "error": err}), 500
 
 # Inicia a thread FORA do __main__ (necessário p/ Gunicorn)
 threading.Thread(target=monitorar, daemon=True).start()
