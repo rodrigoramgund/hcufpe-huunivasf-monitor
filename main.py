@@ -1,3 +1,5 @@
+from zoneinfo import ZoneInfo
+TZ = ZoneInfo("America/Recife")
 import os
 import time
 import json
@@ -56,14 +58,28 @@ def save_state(state: Dict[str, Dict[str, object]]) -> None:
 
 # -------- Coleta / fingerprint --------
 def extrair_pdfs(soup: BeautifulSoup) -> List[str]:
-    links = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        if href.startswith("/"):
-            href = "https://www.gov.br" + href
-        if href.lower().endswith(".pdf"):
-            links.append(href)
-    return sorted(set(links))
+    links = set()
+    for a in soup.select('a[href]'):
+        href = a['href'].strip()
+        text = (a.get_text() or '').strip()
+        href_low = href.lower()
+        text_low = text.lower()
+
+        # normaliza relativo → absoluto
+        if href.startswith('/'):
+            href = 'https://www.gov.br' + href
+            href_low = href.lower()
+
+        # ignora não-links
+        if href_low.startswith('mailto:') or href_low.startswith('javascript:'):
+            continue
+
+        # aceita URLs que contenham .pdf em qualquer posição
+        # ou padrões comuns do Plone (gov.br): @@download/file/...
+        if ('.pdf' in href_low) or ('@@download' in href_low) or ('.pdf' in text_low):
+            links.add(href)
+
+    return sorted(links)
 
 def fingerprint_por_pdf(url: str) -> Optional[Dict[str, object]]:
     try:
@@ -118,10 +134,10 @@ def rodada(state: Dict[str, Dict[str, object]]) -> Dict[str, Dict[str, object]]:
         # status da URL
         last_status["urls"][url] = {
             "pdfs": len(snap.get("pdfs", [])),
-            "last_change": datetime.now().strftime("%Y-%m-%d %H:%M")
+            "last_change": datetime.now(TZ).strftime("%d/%m/%Y %H:%M")
         }
 
-    last_status["last_check"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    last_status["last_check"] = datetime.now(TZ).strftime("%d/%m/%Y %H:%M")
     last_error = None
     return state
 
