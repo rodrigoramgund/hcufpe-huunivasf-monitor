@@ -97,13 +97,33 @@ def fingerprint_por_pdf(url: str) -> Optional[Dict[str, object]]:
         print(f"[ERRO] fingerprint {url}: {e}")
         return None
 
+def fingerprint_por_pdf(url: str) -> Optional[Dict[str, object]]:
+    try:
+        html = get_html(url)
+        if html is None:
+            return None
+        soup = BeautifulSoup(html, "html.parser")
+        pdfs = extrair_pdfs(soup)
+        if pdfs:
+            fp = "PDF:" + hashlib.sha256("\n".join(pdfs).encode("utf-8")).hexdigest()
+            return {"fp": fp, "pdfs": pdfs}
+        texto = soup.get_text(" ", strip=True)
+        fp = "TXT:" + hashlib.sha256(texto.encode("utf-8")).hexdigest()
+        return {"fp": fp, "pdfs": []}
+    except Exception as e:
+        print(f"[ERRO] fingerprint {url}: {e}")
+        return None
+
 # -------- Bot --------
 def enviar_alerta(url: str, novos_pdfs: List[str]):
-    msg = f"⚠️ A página foi atualizada!\n👉 {url}"
-    if novos_pdfs:
-        lista = "\n".join(f"• {x}" for x in novos_pdfs[:20])
-        msg += f"\n\nNovos PDFs detectados:\n{lista}"
-    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+    try:
+        msg = f"⚠️ A página foi atualizada!\n👉 {url}"
+        if novos_pdfs:
+            lista = "\n".join(f"• {x}" for x in novos_pdfs[:20])
+            msg += f"\n\nNovos PDFs detectados:\n{lista}"
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+    except Exception as e:
+        print(f"[WARN] Falha ao enviar Telegram: {e}")
 
 # -------- Uma rodada de verificação --------
 def rodada(state: Dict[str, Dict[str, object]]) -> Dict[str, Dict[str, object]]:
@@ -172,6 +192,16 @@ def monitorar():
         last_error = f"{e}\n{traceback.format_exc()}"
         print(f"[FATAL] thread caiu ao iniciar: {last_error}")
 
+MONITOR_STARTED = False
+def start_monitor_once():
+    global MONITOR_STARTED
+    if not MONITOR_STARTED:
+        MONITOR_STARTED = True
+        threading.Thread(target=monitorar, daemon=True).start()
+
+# inicia 5s após o processo subir (evita brigar com o healthcheck do Render)
+threading.Timer(5.0, start_monitor_once).start()
+
 # -------- Flask --------
 @app.route("/")
 def home():
@@ -209,3 +239,14 @@ threading.Thread(target=monitorar, daemon=True).start()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
+
+def get_html(url: str, tries: int = 3) -> Optional[str]:
+    for i in range(tries):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=25)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            print(f"[HTTP] tentativa {i+1}/{tries} falhou em {url}: {e}")
+            time.sleep(2)
+    return None
